@@ -1,0 +1,5 @@
+{
+  "id": "calendar",
+  "description": "Every calendar on this Mac on one board, a composer pill before the next meeting, and one tap to join.",
+  "requirements": { "paseo": ">=0.8.0" }
+}
