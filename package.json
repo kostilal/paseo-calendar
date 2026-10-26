@@ -1,7 +1,7 @@
 {
   "name": "paseo-calendar",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Every calendar on this Mac on one board, a composer pill before the next meeting, and one tap to join.",
   "license": "MIT",
   "repository": {
