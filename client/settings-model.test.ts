@@ -1,3 +1,6 @@
+// Pinned: the fixtures' local days are Warsaw days (node --test gives each file its own process).
+process.env.TZ = "Europe/Warsaw";
+
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { AccountView } from "../shared/calendar.ts";
@@ -51,7 +54,6 @@ test("a row with no stored calendars offers to read them again, but only while i
   assert.equal(accountRow(row({ calendars: [], sourceId: "" }), en, "en").reread, false, "no source to connect to");
 });
 test("a row whose source has gone is greyed and says since when", () => {
-  // Noon UTC: the same calendar day in every zone from UTC−11 to UTC+11.
   const model = accountRow(row({ errorCode: "source_gone", missingSince: "2026-10-20T12:00:00.000Z" }), en, "en");
   assert.equal(model.subtitle, en.notOnMacSince("Oct 20, 2026"));
   assert.deepEqual([model.health, model.greyed], ["idle", true]);

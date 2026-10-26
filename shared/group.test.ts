@@ -1,3 +1,6 @@
+// Pinned: the fixtures' local days are Warsaw days (node --test gives each file its own process).
+process.env.TZ = "Europe/Warsaw";
+
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { EventsView, EventView } from "./calendar.ts";
