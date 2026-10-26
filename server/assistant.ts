@@ -28,9 +28,10 @@ import { waitAtMost, type Sync } from "./sync.ts";
  *
  * The add is guarded the way that plugin guarded it, minus its file of past adds: one exact
  * calendar, a read of the target day for a copy that is already there, and a read back after the
- * write. A retry after a lost answer is caught by that first read, because create() waits for the
- * refresh it fires and range() awaits a refresh in flight, so the copy the first try made is
- * already in it.
+ * write. A retry after a lost answer is caught by that first read. The add queue below holds the
+ * retry until the first try's create and read-back are done, and that read-back has waited for
+ * the refresh create() fires, so the copy the first try made is already in it. Every answer goes
+ * out within ADD_ANSWER_MS, before the plugin host's cut-off.
  */
 
 export const ACCESS_HELP =
@@ -43,14 +44,38 @@ export const SYNC_NOTE =
   "whether the provider has accepted it, so provider sync is not confirmed here (check the provider's own calendar, or ask again in a minute).";
 
 /**
+ * The longest add_event and event_preview take to answer, counted from the call, whatever sync
+ * does inside. The plugin host cuts an RPC off at 30 seconds, and God Mode then tells ChatGPT it
+ * does not know whether the add took effect, which is the answer most likely to be retried. One
+ * account whose helper is stuck holds every refresh for its 15-second read budget, and an add waits
+ * for one refresh before it reads the day and for another after it writes (create() for up to
+ * POST_WRITE_WAIT_MS, then range() for the rest of it), so a single stuck account is enough to
+ * pass 30 seconds.
+ *
+ * At the cut-off the answer says what is true at that moment. If the add has not reached
+ * create(), it says nothing was added, and the add then never calls create(). If it has, the
+ * answer says the save is not confirmed and to check the calendar before adding it again. Either
+ * way the add runs on behind its answer and keeps its place in the add queue below.
+ */
+export const ADD_ANSWER_MS = 25_000;
+const SECONDS = ADD_ANSWER_MS / 1000;
+
+/** The cut-off came while the add was still reading: nothing was written, and nothing will be. */
+const READ_LATE =
+  `the calendars on this Mac did not answer within ${SECONDS} seconds (an account may be slow or stuck), so the day could not ` +
+  "be checked for a copy; nothing was added. Try again in a minute.";
+/** The cut-off came while the add was still waiting behind an earlier one, which may be this same event. */
+const QUEUED_LATE =
+  `an earlier add was still running ${SECONDS} seconds after this request came in, so this one could not check the day for a ` +
+  "copy; nothing was added by this request. Try again in a minute: if the earlier add saved this event, the answer then says " +
+  "it is already there.";
+
+/**
  * How long a real add waits for the refresh it starts before reading the day, and again after a
- * save that reported an error. One account whose helper is stuck holds a refresh for 15 seconds
- * or more, and create() waits up to POST_WRITE_WAIT_MS for its own: together they can pass the
- * plugin host's 30 seconds, and God Mode then tells ChatGPT it does not know whether the add took
- * effect. Past the cap the add reads whatever range() gives it; the add queue below still keeps a
- * second add from reading before the first one's create. This bounds the add's own wait only:
- * sync's range() waits for a refresh in flight and its create() queues behind one, so against the
- * real sync a stuck refresh still holds the read and the write for as long as it runs.
+ * save that reported an error. Past it the add goes on to range(). The real sync's range() waits
+ * on its own for a refresh in flight, so against createSync this cap does not make the add any
+ * shorter. ADD_ANSWER_MS is what bounds the answer. This cap bounds only the assistant's own wait,
+ * for a sync whose range() answers from what it holds.
  */
 export const PRE_WRITE_WAIT_MS = 5_000;
 
@@ -152,6 +177,23 @@ function refused(error: string): AddEventAnswer {
   };
 }
 
+/**
+ * Saved, or perhaps saved, and not confirmed the way a clean save is. `ok` stays true: God Mode
+ * takes false as "not done", and that invites the retry that adds a second copy.
+ */
+function unverified(summary: string, event: Added, conflicts: AddEventAnswer["conflicts"]): AddEventAnswer {
+  return {
+    ok: true,
+    status: "saved_unverified",
+    summary,
+    would_create: null,
+    event,
+    conflicts,
+    provider_sync: "not_confirmed",
+    error: "",
+  };
+}
+
 function planned(plan: PlannedEvent, zone: string, calendar: string, eventId = ""): Added {
   return {
     title: plan.title,
@@ -221,25 +263,75 @@ function messageOf(error: unknown): string {
  * retries with the same confirmation, which God Mode accepts for 120. range() waits for a refresh
  * in flight but not for a create in flight, so a retry reading the day beside the first call would
  * find no copy and add a second. Queued, its read comes after the first call's create and the
- * refresh create() waits for, finds the event, and answers already_exists. Never rejects, so one
- * failed add cannot stall the ones behind it.
+ * refresh create() waits for, finds the event, and answers already_exists.
+ *
+ * The queue holds each add's whole work, not its answer. An add answered at ADD_ANSWER_MS still
+ * holds the next one until its create and its read-back are done, so the cut-off cannot let a
+ * retry read the day before the first try's event is in it. Never rejects, so one failed add
+ * cannot stall the ones behind it.
  */
 let adding: Promise<unknown> = Promise.resolve();
+
+/** How far one call has got, so that the answer at ADD_ANSWER_MS says what is true at that moment. */
+interface Progress {
+  /** Set at the cut-off. An add that has not called create() by then never calls it. */
+  cancelled: boolean;
+  /** The answer if the cut-off comes now. */
+  late: () => AddEventAnswer;
+}
+
+/**
+ * Whichever comes first, the work's own answer or ADD_ANSWER_MS. The cut-off sets `cancelled` and
+ * reads `late` in one synchronous step, so the work cannot reach create() in between: it either
+ * called create() before, and `late` already says so, or it finds `cancelled` set and stops.
+ */
+function answeredInTime(work: Promise<AddEventAnswer>, progress: Progress): Promise<AddEventAnswer> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const cutOff = new Promise<AddEventAnswer>((resolve) => {
+    timer = setTimeout(() => {
+      progress.cancelled = true;
+      resolve(progress.late());
+    }, ADD_ANSWER_MS);
+  });
+  return Promise.race([work, cutOff]).finally(() => clearTimeout(timer));
+}
 
 /**
  * Preview (dry_run) or add one timed event. Every check runs before anything is written, and in
  * the same order for both, so a preview that answered "Would create" is what the add will do —
  * unless the day changed in between, which the add then reads for itself. A preview writes
  * nothing, so it does not wait behind an add.
+ *
+ * Either one answers within ADD_ANSWER_MS of this call. Sync can be a promise of one: the daemon
+ * hands in the one it is still starting, so that a slow first read counts against the same bound.
  */
-export function answerAddEvent(sync: AssistantSync, input: AddEventInput, nowMs: number, zone: string): Promise<AddEventAnswer> {
-  if (input.dry_run) return addOrPreview(sync, input, nowMs, zone);
-  const run = adding.then(() => addOrPreview(sync, input, nowMs, zone));
+export function answerAddEvent(
+  sync: AssistantSync | PromiseLike<AssistantSync>,
+  input: AddEventInput,
+  nowMs: number,
+  zone: string,
+): Promise<AddEventAnswer> {
+  const progress: Progress = { cancelled: false, late: () => refused(input.dry_run ? READ_LATE : QUEUED_LATE) };
+  const work = async (): Promise<AddEventAnswer> => {
+    progress.late = () => refused(READ_LATE);
+    const ready = await sync;
+    // Its answer has already gone out: it was queued behind a long add, or the daemon was slow to start.
+    if (progress.cancelled) return progress.late();
+    return addOrPreview(ready, input, nowMs, zone, progress);
+  };
+  if (input.dry_run) return answeredInTime(work(), progress);
+  const run = adding.then(work);
   adding = run.catch(() => undefined);
-  return run;
+  return answeredInTime(run, progress);
 }
 
-async function addOrPreview(sync: AssistantSync, input: AddEventInput, nowMs: number, zone: string): Promise<AddEventAnswer> {
+async function addOrPreview(
+  sync: AssistantSync,
+  input: AddEventInput,
+  nowMs: number,
+  zone: string,
+  progress: Progress,
+): Promise<AddEventAnswer> {
   // A throw before the write is still an answer: nothing was added, and saying so plainly keeps
   // God Mode from reporting "unknown whether it took effect", which invites a retry.
   let settings: SettingsView;
@@ -260,8 +352,8 @@ async function addOrPreview(sync: AssistantSync, input: AddEventInput, nowMs: nu
   const to = new Date(Math.max(zonedMidnight(addDays(plan.date, 1), zone), plan.endMs));
   // Before a write, the day is read fresh rather than from the snapshot, which can be minutes old:
   // an event added on the phone since then must still be found as the copy it is. A preview reads
-  // what is held, since it writes nothing. A refresh that fails, or is still running after
-  // PRE_WRITE_WAIT_MS, leaves range() to decide.
+  // what is held, since it writes nothing. A refresh that fails leaves range() to decide. One still
+  // running after PRE_WRITE_WAIT_MS is waited for by the real range() itself, within ADD_ANSWER_MS.
   if (!input.dry_run) await waitAtMost(sync.refresh(), PRE_WRITE_WAIT_MS);
   let day: EventsView;
   try {
@@ -317,6 +409,16 @@ async function addOrPreview(sync: AssistantSync, input: AddEventInput, nowMs: nu
     };
   }
 
+  // The cut-off came while the day was being read, and that answer said nothing was added. This
+  // check, the switch of `late` and the call to create() run in one synchronous step.
+  if (progress.cancelled) return progress.late();
+  progress.late = () =>
+    unverified(
+      `Saving to ${label} had not answered after ${SECONDS} seconds, so it is not confirmed: ${when(preview, zone)}. ` +
+        "Check that calendar before adding it again.",
+      preview,
+      conflicts,
+    );
   const result = await sync
     .create({
       accountId: target.accountId,
@@ -331,46 +433,51 @@ async function addOrPreview(sync: AssistantSync, input: AddEventInput, nowMs: nu
     // A helper that timed out may have saved anyway, and create() skips its refresh after an
     // error, so the snapshot cannot say. A fresh pass, waited for no longer than the one before
     // the write, and a second read decide: "nothing added" while the event is there is exactly
-    // the answer that makes ChatGPT add it again.
+    // the answer that makes ChatGPT add it again. For the same reason a cut-off during that read
+    // does not say "nothing added" either.
+    progress.late = () =>
+      unverified(
+        `Saving to ${label} reported an error (${result.error}), and the read that would show whether it was saved anyway ` +
+          `did not finish within ${SECONDS} seconds. Check that calendar before adding it again.`,
+        preview,
+        conflicts,
+      );
     await waitAtMost(sync.refresh(), PRE_WRITE_WAIT_MS);
     const again = await sync.range(from, to).catch(() => null);
     const landed = again?.events.find((event) => isSameAdded(event, target, plan));
     if (!landed) return refused(result.error);
     const event = presented(landed, zone, label, landed.id);
-    return {
-      ok: true,
-      status: "saved_unverified",
-      summary:
-        `Saving to ${label} reported an error (${result.error}), but it is there now: ${when(event, zone)}. ` +
+    return unverified(
+      `Saving to ${label} reported an error (${result.error}), but it is there now: ${when(event, zone)}. ` +
         "Check that calendar before adding it again.",
-      would_create: null,
       event,
       conflicts,
-      provider_sync: "not_confirmed",
-      error: "",
-    };
+    );
   }
 
-  // create() has waited for its refresh, so the new event is in the snapshot by now. A read that
-  // fails here is reported as unverified, never as a failure: the event was saved, and an
-  // answer that says otherwise is what makes ChatGPT add it a second time.
+  // create() waited for its refresh for at most POST_WRITE_WAIT_MS, and range() waits for
+  // whatever of that refresh is still running, so the new event is in what this reads. If that
+  // takes past ADD_ANSWER_MS, the answer has already gone out as unverified. A read that fails
+  // here is reported as unverified too, never as a failure: the event was saved, and an answer
+  // that says otherwise is what makes ChatGPT add it a second time.
   const createdId = result.event?.id ?? "";
+  progress.late = () =>
+    unverified(
+      `Saved in ${label}, but reading it back did not finish within ${SECONDS} seconds. Check that calendar before adding it again.`,
+      planned(plan, zone, label, createdId),
+      conflicts,
+    );
   const back = await sync.range(from, to).catch(() => null);
   const found = back
     ? ((createdId ? back.events.find((event) => event.accountId === target.accountId && event.id === createdId) : undefined) ??
       back.events.find((event) => isSameAdded(event, target, plan)))
     : undefined;
   if (!found) {
-    return {
-      ok: true,
-      status: "saved_unverified",
-      summary: `Saved in ${label}, but reading it back did not find it. Check that calendar before adding it again.`,
-      would_create: null,
-      event: planned(plan, zone, label, createdId),
+    return unverified(
+      `Saved in ${label}, but reading it back did not find it. Check that calendar before adding it again.`,
+      planned(plan, zone, label, createdId),
       conflicts,
-      provider_sync: "not_confirmed",
-      error: "",
-    };
+    );
   }
   // A row kept from another account's copy carries that copy's id; the one create() named is the target's.
   const event = presented(found, zone, label, createdId || found.id);

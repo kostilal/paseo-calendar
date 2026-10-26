@@ -89,7 +89,9 @@ export default function contribute(server: PluginServerContext) {
   // server/capabilities.ts). The zone is read on every call, so a Mac that changed zone is followed.
   server.handle(getSchedule, async (input) => readSchedule(await started, input, Date.now()));
   server.handle(listCalendars, async () => answerCalendars(await started, daemonTimeZone()));
-  server.handle(addEvent, async (input) => answerAddEvent(await started, input, Date.now(), daemonTimeZone()));
+  // Handed the promise, not the sync: add_event answers within ADD_ANSWER_MS of the call, and a
+  // daemon still on its first read counts against that bound too.
+  server.handle(addEvent, async (input) => answerAddEvent(started, input, Date.now(), daemonTimeZone()));
   server.handle(describeRpc, () => describeCalendar());
 
   return () => {

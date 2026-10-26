@@ -178,6 +178,10 @@ it by its id `calendar`, its title, or an alias such as "schedule", "agenda", "m
   lists them.
 - **`add_event` always asks first.** Its risk is `outward`, and God Mode asks you before any
   action that is not `low`. It never edits, moves, answers or deletes a meeting.
+- **`event_preview` and `add_event` answer within 25 seconds**, before Paseo's 30-second
+  cut-off, even when an account on this Mac is slow to read. If the day could not be read by
+  then, the answer says nothing was added. If the save had already started, it says the save is
+  not confirmed and asks you to check that calendar before adding the event again.
 - **What leaves the Mac.** God Mode passes these answers to ChatGPT, so they go to OpenAI:
   meeting titles, times, calendar names, the accounts' addresses (calendar names carry them),
   overlaps, and call links when asked. Notes, locations and guests are never in an answer.

@@ -1,9 +1,13 @@
-import { test } from "node:test";
+import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { setTimeout as sleep } from "node:timers/promises";
 import type { AddEventAnswer, EventsView, EventView, SettingsView } from "../shared/calendar.ts";
+import type { Event } from "../shared/event.ts";
 import { ACCOUNTS, NOW, ZONE, meeting } from "../shared/add-event.fixtures.ts";
-import { ACCESS_HELP, PRE_WRITE_WAIT_MS, answerAddEvent, answerCalendars, type AssistantSync } from "./assistant.ts";
+import { ACCESS_HELP, ADD_ANSWER_MS, PRE_WRITE_WAIT_MS, answerAddEvent, answerCalendars, type AssistantSync } from "./assistant.ts";
+import type { CreateInput } from "./eventkit.ts";
+import { emptyStored, type Stored, type StoredAccount } from "./store.ts";
+import { createSync } from "./sync.ts";
 
 function settings(over: Partial<SettingsView> = {}): SettingsView {
   return { accounts: ACCOUNTS, access: "granted", pillLeadMinutes: 30, defaultView: "day", connect: null, storeAside: "", storeBroken: false, foundFailed: false, accessError: "",
@@ -228,7 +232,8 @@ test("two adds at once write once: the second reads the first one's event and an
 });
 
 test("an add gives a stuck refresh PRE_WRITE_WAIT_MS, then checks for a copy in what is held and writes once", async (t) => {
-  // Against this fake, whose range() answers at once; the real one waits for a refresh in flight.
+  // The assistant's own wait only. This fake's range() answers at once, while the real one waits
+  // for a refresh in flight; the macSync tests below run the real one, and ADD_ANSWER_MS bounds it.
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const { sync, creates, refreshes, release } = fakeSync({ views: [view([]), view([meeting({ id: "new-1" })])], stuckRefresh: true });
   try {
@@ -298,6 +303,167 @@ test("two adds at once while the refresh is stuck still write once: the queue, n
   } finally {
     stuck.release();
   }
+});
+
+/**
+ * The real sync, over a store in memory and a fake Mac with two accounts: Exchange, which add_event
+ * writes to and which reads back whatever was saved, and iCloud, whose every read, once slow() is
+ * called, takes `slowMs` and then fails the way the helper fails at its read budget. This is what
+ * the fakes above cannot stand in for: the real range() waits for a refresh in flight, and the
+ * real create() queues behind one and then waits for its own. With setTimeout mocked, a slow read
+ * costs no real time.
+ */
+function macSync(slowMs: number, options: { saveThenFail?: boolean } = {}) {
+  const row = (id: string, title: string, kind: string, owner: string, calendar: { id: string; name: string }): StoredAccount => ({
+    id, sourceId: `s-${id}`, title, owner, kind, calendars: [{ ...calendar, shown: true }],
+    lastError: "", errorCode: "", missingSince: "", lastSyncAt: "",
+  });
+  const rows = [
+    row("ex", "Exchange", "exchange", "me@example.com", { id: "c-ex", name: "Calendar" }),
+    row("ic", "iCloud", "icloud", "", { id: "c-home", name: "Home" }),
+  ];
+  let stored: Stored = { ...emptyStored(), accounts: structuredClone(rows) };
+  const saved: Event[] = [];
+  const creates: CreateInput[] = [];
+  let slow = false;
+  const sync = createSync({
+    read: async () => ({ stored: structuredClone(stored), broken: false }),
+    write: async (value) => { stored = structuredClone(value); },
+    log: () => {},
+    now: () => NOW,
+    available: () => true,
+    accessStatus: async () => "granted",
+    fetchSources: async () => rows.map((entry) => ({ id: entry.sourceId, title: entry.title, kind: entry.kind, calendars: 1 })),
+    fetchCalendars: async () => [],
+    fetchEvents: async (account) => {
+      if (account.id === "ex") return saved.map((event) => ({ ...event }));
+      if (!slow) return [];
+      await new Promise((resolve) => setTimeout(resolve, slowMs));
+      throw new Error(`eventkit helper timed out after ${slowMs}ms`);
+    },
+    createEvent: async (account, _stored, input) => {
+      creates.push({ ...input });
+      const event: Event = { id: `new-${creates.length}`, accountId: account.id, calendarId: input.calendarId, calendarName: "Calendar",
+        title: input.title, start: input.start, end: input.end, allDay: false, recurring: false, mine: true, attendees: [],
+        location: "", description: "", webLink: "", myResponse: "accepted" };
+      saved.push(event);
+      // A helper that ran out of time after EventKit had already saved.
+      if (options.saveThenFail) throw new Error("eventkit helper timed out after 15000ms");
+      return event;
+    },
+  });
+  return { sync, creates, slow: () => { slow = true; } };
+}
+/** Moves mocked time on a quarter of a second at a time, letting every promise run in between, as real time would. */
+async function advance(t: TestContext, ms: number): Promise<void> {
+  for (let passed = 0; passed < ms; passed += 250) {
+    t.mock.timers.tick(Math.min(250, ms - passed));
+    await drained();
+  }
+}
+
+test("against the real sync, an account stuck for the helper's whole read budget cannot hold an add past ADD_ANSWER_MS", async (t) => {
+  // 15 s a read: the add waits for one refresh before it reads the day and for another after it
+  // writes, which without a bound answered at 30 s, the plugin host's cut-off.
+  const mac = macSync(15_000);
+  await mac.sync.refresh();
+  mac.slow();
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const first = pending(answerAddEvent(mac.sync, INPUT, NOW, ZONE));
+  const retry = pending(answerAddEvent(mac.sync, INPUT, NOW, ZONE));
+  await advance(t, ADD_ANSWER_MS);
+  assert.equal(mac.creates.length, 1, "written once, after the day was read");
+  assert.deepEqual([first()?.ok, first()?.status, first()?.provider_sync, first()?.event?.event_id], [true, "saved_unverified", "not_confirmed", undefined]);
+  assert.equal(
+    first()?.summary,
+    "Saving to Exchange/Calendar (me@example.com) had not answered after 25 seconds, so it is not confirmed: Dentist, 2026-10-27 " +
+      "10:00–10:30 Europe/Warsaw. Check that calendar before adding it again.",
+  );
+  assert.deepEqual([retry()?.ok, retry()?.status], [false, "refused"], "still behind the first add, so it added nothing");
+  assert.match(retry()?.summary ?? "", /^Not added: an earlier add was still running 25 seconds after this request came in/);
+  // Both run on behind their answers. Once they are done, asking again finds the event.
+  await advance(t, 30_000);
+  const third = pending(answerAddEvent(mac.sync, INPUT, NOW, ZONE));
+  await advance(t, ADD_ANSWER_MS);
+  assert.deepEqual([third()?.status, mac.creates.length], ["already_exists", 1]);
+});
+
+test("against the real sync, the re-read after a save that reported an error is cut off at ADD_ANSWER_MS as well", async (t) => {
+  const mac = macSync(15_000, { saveThenFail: true });
+  await mac.sync.refresh();
+  mac.slow();
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const answer = pending(answerAddEvent(mac.sync, INPUT, NOW, ZONE));
+  await advance(t, ADD_ANSWER_MS);
+  assert.equal(mac.creates.length, 1);
+  assert.deepEqual([answer()?.ok, answer()?.status, answer()?.error], [true, "saved_unverified", ""]);
+  assert.equal(
+    answer()?.summary,
+    "Saving to Exchange/Calendar (me@example.com) reported an error (eventkit helper timed out after 15000ms), and the read that " +
+      "would show whether it was saved anyway did not finish within 25 seconds. Check that calendar before adding it again.",
+  );
+  // Lets the re-read finish, so the add queue is free for the tests after this one.
+  await advance(t, 30_000);
+});
+
+test("against the real sync, two adds at once while an account is slow write once, and both answer in time", async (t) => {
+  const mac = macSync(7_000);
+  await mac.sync.refresh();
+  mac.slow();
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const first = pending(answerAddEvent(mac.sync, INPUT, NOW, ZONE));
+  const second = pending(answerAddEvent(mac.sync, INPUT, NOW, ZONE));
+  await advance(t, ADD_ANSWER_MS);
+  assert.deepEqual([first()?.status, second()?.status, mac.creates.length], ["saved_locally_verified", "already_exists", 1]);
+});
+
+test("an add still reading the day at ADD_ANSWER_MS says nothing was added, and never writes afterwards", async (t) => {
+  // 40 s a read: two accounts stuck at once.
+  const mac = macSync(40_000);
+  await mac.sync.refresh();
+  mac.slow();
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const answer = pending(answerAddEvent(mac.sync, INPUT, NOW, ZONE));
+  await advance(t, ADD_ANSWER_MS - 250);
+  assert.equal(answer(), undefined);
+  await advance(t, 250);
+  assert.deepEqual([answer()?.ok, answer()?.status], [false, "refused"]);
+  assert.equal(
+    answer()?.summary,
+    "Not added: the calendars on this Mac did not answer within 25 seconds (an account may be slow or stuck), so the day could " +
+      "not be checked for a copy; nothing was added. Try again in a minute.",
+  );
+  await advance(t, 60_000);
+  assert.equal(mac.creates.length, 0, "the day came back at 40 s, after the answer, and the add stopped there");
+});
+
+test("a preview behind a stuck refresh answers at ADD_ANSWER_MS too", async (t) => {
+  const mac = macSync(40_000);
+  await mac.sync.refresh();
+  mac.slow();
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  void mac.sync.refresh(); // the five-minute tick, in flight when the preview arrives
+  const answer = pending(answerAddEvent(mac.sync, { ...INPUT, dry_run: true }, NOW, ZONE));
+  await advance(t, ADD_ANSWER_MS);
+  assert.deepEqual([answer()?.ok, answer()?.status], [false, "refused"]);
+  await advance(t, 60_000);
+  assert.equal(mac.creates.length, 0);
+});
+
+test("ADD_ANSWER_MS counts from the call, so a daemon still starting cannot hold an add past it either", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let ready: (sync: AssistantSync) => void = () => {};
+  const starting = new Promise<AssistantSync>((resolve) => { ready = resolve; });
+  const answer = pending(answerAddEvent(starting, INPUT, NOW, ZONE));
+  await advance(t, ADD_ANSWER_MS - 250);
+  assert.equal(answer(), undefined);
+  await advance(t, 250);
+  assert.deepEqual([answer()?.ok, answer()?.status], [false, "refused"]);
+  assert.match(answer()?.summary ?? "", /did not answer within 25 seconds/);
+  const { sync, ranges, creates, refreshes } = fakeSync({});
+  ready(sync);
+  await drained();
+  assert.deepEqual([ranges, refreshes, creates], [[], [], []], "it started after its answer had gone out, so it does nothing");
 });
 
 test("saved but not found on the way back is still done, so ChatGPT never adds it twice", async () => {
