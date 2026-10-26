@@ -116,7 +116,7 @@ function addOperations(): Record<string, unknown>[] {
       title: "Add one event to a calendar",
       description:
         "Adds ONE timed event to the exact calendar the user named (it then syncs to that account). No guests, invitations, " +
-        "video links or alarms; never edits or deletes. Repeating the same event returns the existing one. Answer: `summary`, " +
+        "video links or alarms; never edits or deletes. Repeating the same event returns the existing one (a repeat sent while the first is still saving may be refused; ask again a minute later). Answer: `summary`, " +
         "`event`, `provider_sync` (not_confirmed means saved on the Mac, upload to the provider not yet confirmed).",
       input,
       fixed: { dry_run: false },

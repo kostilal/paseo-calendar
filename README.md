@@ -166,7 +166,7 @@ it by its id `calendar`, its title, or an alias such as "schedule", "agenda", "m
 | `period` | read | `from`, `to`, `time_zone`, `with_links`, `include_declined` | The schedule from `from` to `to`, both included, at most 31 days. |
 | `calendars` | read | none | The accounts with their addresses, their calendars, which ones accept new events and which are hidden, and accounts missing from the Mac. |
 | `event_preview` | read | `title`, `date`, `start_time`, `duration_minutes`, `calendar` | Finds the exact calendar, says whether the same event already exists, and lists overlaps. Creates nothing. |
-| `add_event` | action | the same as `event_preview` | Adds one timed event to that calendar. Asking again for the same event returns the one already there. |
+| `add_event` | action | the same as `event_preview` | Adds one timed event to that calendar. Asking again for the same event returns the one already there; a repeat sent while the first is still saving may be refused, and asking again a minute later finds it. |
 
 - `date`, `from` and `to` take `YYYY-MM-DD`, `today`, `tomorrow`, `yesterday` or an English
   weekday name (the next one, today included); an empty `date` is today. `time_zone` is an IANA

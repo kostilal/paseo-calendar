@@ -353,7 +353,8 @@ async function addOrPreview(
   // Before a write, the day is read fresh rather than from the snapshot, which can be minutes old:
   // an event added on the phone since then must still be found as the copy it is. A preview reads
   // what is held, since it writes nothing. A refresh that fails leaves range() to decide. One still
-  // running after PRE_WRITE_WAIT_MS is waited for by the real range() itself, within ADD_ANSWER_MS.
+  // running after PRE_WRITE_WAIT_MS is waited for by the real range() itself, with no limit;
+  // ADD_ANSWER_MS bounds the answer, not this wait.
   if (!input.dry_run) await waitAtMost(sync.refresh(), PRE_WRITE_WAIT_MS);
   let day: EventsView;
   try {
@@ -414,7 +415,7 @@ async function addOrPreview(
   if (progress.cancelled) return progress.late();
   progress.late = () =>
     unverified(
-      `Saving to ${label} had not answered after ${SECONDS} seconds, so it is not confirmed: ${when(preview, zone)}. ` +
+      `Saving to ${label} was not confirmed within ${SECONDS} seconds: ${when(preview, zone)}. ` +
         "Check that calendar before adding it again.",
       preview,
       conflicts,

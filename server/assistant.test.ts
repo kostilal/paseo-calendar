@@ -376,7 +376,7 @@ test("against the real sync, an account stuck for the helper's whole read budget
   assert.deepEqual([first()?.ok, first()?.status, first()?.provider_sync, first()?.event?.event_id], [true, "saved_unverified", "not_confirmed", undefined]);
   assert.equal(
     first()?.summary,
-    "Saving to Exchange/Calendar (me@example.com) had not answered after 25 seconds, so it is not confirmed: Dentist, 2026-10-27 " +
+    "Saving to Exchange/Calendar (me@example.com) was not confirmed within 25 seconds: Dentist, 2026-10-27 " +
       "10:00–10:30 Europe/Warsaw. Check that calendar before adding it again.",
   );
   assert.deepEqual([retry()?.ok, retry()?.status], [false, "refused"], "still behind the first add, so it added nothing");
