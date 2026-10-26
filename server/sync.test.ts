@@ -13,6 +13,7 @@ import {
   SOURCE_MISSING,
   TICK_MS,
   versionOf,
+  waitAtMost,
   type Sync,
   type SyncDeps,
 } from "./sync.ts";
@@ -1767,6 +1768,12 @@ function stalling() {
     },
   };
 }
+
+test("waitAtMost is true for work that finished in time, failed or not, false at the cap, and never rejects", async () => {
+  assert.equal(await waitAtMost(Promise.resolve("done"), 1_000), true);
+  assert.equal(await waitAtMost(Promise.reject(new Error("boom")), 1_000), true);
+  assert.equal(await waitAtMost(new Promise(() => {}), 5), false);
+});
 
 test("an edit answers within the post-write cap however long the refresh after it takes", async () => {
   const slow = stalling();

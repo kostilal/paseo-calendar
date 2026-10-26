@@ -58,6 +58,25 @@ const RANGE_TTL_MS = 60_000;
  * the answer goes out and the refresh finishes on its own.
  */
 export const POST_WRITE_WAIT_MS = 20_000;
+
+/**
+ * Waits for `work` to finish, but never longer than `ms`: true when it finished in time, failed
+ * or not, false when the cap came first. Never rejects, and leaves no timer behind. The work runs
+ * on after the cap, and a failure it has then is absorbed here as well, so a caller that wants
+ * to log one attaches its own handler before passing it in.
+ */
+export async function waitAtMost(work: Promise<unknown>, ms: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const capped = new Promise<boolean>((resolve) => {
+    timer = setTimeout(() => resolve(false), ms);
+  });
+  try {
+    return await Promise.race([work.then(() => true, () => true), capped]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 const MAX_CACHED_RANGES = 24;
 const ACCOUNT_GONE = "that account is no longer connected";
 /**
@@ -503,20 +522,12 @@ export function createSync(deps: SyncDeps): Sync {
    * or is still running only means the next tick reads it, so it is logged, not reported.
    */
   async function settle(after: string): Promise<void> {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const refreshed = api.refresh().then(
-      () => true,
-      (error: unknown) => {
-        deps.log(`calendar: refresh after ${after} failed: ${String(error)}`);
-        return true;
-      },
-    );
-    const capped = new Promise<boolean>((resolve) => {
-      timer = setTimeout(() => resolve(false), deps.postWriteWaitMs ?? POST_WRITE_WAIT_MS);
+    const refreshed = api.refresh().catch((error: unknown) => {
+      deps.log(`calendar: refresh after ${after} failed: ${String(error)}`);
     });
-    const done = await Promise.race([refreshed, capped]);
-    clearTimeout(timer);
-    if (!done) deps.log(`calendar: refresh after ${after} is still running; answered without it`);
+    if (!(await waitAtMost(refreshed, deps.postWriteWaitMs ?? POST_WRITE_WAIT_MS))) {
+      deps.log(`calendar: refresh after ${after} is still running; answered without it`);
+    }
   }
 
   /**

@@ -1,9 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { setTimeout as sleep } from "node:timers/promises";
-import type { EventsView, EventView, SettingsView } from "../shared/calendar.ts";
+import type { AddEventAnswer, EventsView, EventView, SettingsView } from "../shared/calendar.ts";
 import { ACCOUNTS, NOW, ZONE, meeting } from "../shared/add-event.fixtures.ts";
-import { ACCESS_HELP, answerAddEvent, answerCalendars, type AssistantSync } from "./assistant.ts";
+import { ACCESS_HELP, PRE_WRITE_WAIT_MS, answerAddEvent, answerCalendars, type AssistantSync } from "./assistant.ts";
 
 function settings(over: Partial<SettingsView> = {}): SettingsView {
   return { accounts: ACCOUNTS, access: "granted", pillLeadMinutes: 30, defaultView: "day", connect: null, storeAside: "", storeBroken: false, foundFailed: false, accessError: "",
@@ -12,16 +12,43 @@ function settings(over: Partial<SettingsView> = {}): SettingsView {
 function view(events: EventView[], errors: EventsView["errors"] = []): EventsView {
   return { events, clashes: [], errors, syncedAt: "2026-10-25T08:58:00.000Z", version: "v1", unchanged: false };
 }
+/** Refreshes that do not answer until released: an account whose helper is stuck past its budget. */
+function stuckRefreshes() {
+  const held: (() => void)[] = [];
+  let released = false;
+  return {
+    refresh: () => (released ? Promise.resolve(view([])) : new Promise<EventsView>((resolve) => held.push(() => resolve(view([]))))),
+    /**
+     * Finishes the stuck ones and answers every later one at once, so an add a failed test left
+     * waiting cannot hold the add queue, and every test after it, for good.
+     */
+    release: () => {
+      released = true;
+      for (const finish of held.splice(0)) finish();
+    },
+  };
+}
+/** Runs everything already queued: with setTimeout mocked, an add then stands still only at a timer. */
+const drained = () => new Promise<void>((resolve) => setImmediate(resolve));
+/** An add's answer once it has one, undefined while it is still waiting. */
+function pending(answer: Promise<AddEventAnswer>): () => AddEventAnswer | undefined {
+  let value: AddEventAnswer | undefined;
+  void answer.then((settled) => { value = settled; });
+  return () => value;
+}
 function fakeSync(options: {
   settings?: Partial<SettingsView>; views?: EventsView[]; createError?: string;
   /** Throw from this call instead of answering. */
   throws?: "settings" | "range" | "create";
+  /** Every refresh hangs until release(). */
+  stuckRefresh?: boolean;
 }) {
   const ranges: [string, string][] = [];
   const creates: Record<string, unknown>[] = [];
   /** How many ranges had been read when each refresh was asked for. */
   const refreshes: number[] = [];
   const views = [...(options.views ?? [view([])])];
+  const stuck = stuckRefreshes();
   const sync: AssistantSync = {
     settings: async () => { if (options.throws === "settings") throw new Error("boom"); return settings(options.settings); },
     range: async (from, to) => {
@@ -33,9 +60,9 @@ function fakeSync(options: {
       if (options.throws === "create") throw new Error("the calendar helper timed out");
       return { event: null, error: options.createError ?? "" };
     },
-    refresh: async () => { refreshes.push(ranges.length); return view([]); },
+    refresh: async () => { refreshes.push(ranges.length); return options.stuckRefresh ? stuck.refresh() : view([]); },
   };
-  return { sync, ranges, creates, refreshes };
+  return { sync, ranges, creates, refreshes, release: stuck.release };
 }
 const INPUT = { title: "Dentist", date: "2026-10-27", start_time: "10:00", duration_minutes: 30, calendar: "me@example.com", dry_run: false };
 const DAY: [string, string] = ["2026-10-26T23:00:00.000Z", "2026-10-27T23:00:00.000Z"];
@@ -198,6 +225,79 @@ test("two adds at once write once: the second reads the first one's event and an
   const preview = await answerAddEvent(sync, { ...INPUT, dry_run: true }, NOW, ZONE);
   assert.deepEqual([preview.status, saved.length], ["dry_run", 0]); // queued, it would have read the saved copy
   assert.equal((await adding).status, "saved_locally_verified");
+});
+
+test("an add gives a stuck refresh PRE_WRITE_WAIT_MS, then checks for a copy in what is held and writes once", async (t) => {
+  // Against this fake, whose range() answers at once; the real one waits for a refresh in flight.
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { sync, creates, refreshes, release } = fakeSync({ views: [view([]), view([meeting({ id: "new-1" })])], stuckRefresh: true });
+  try {
+    const answer = pending(answerAddEvent(sync, INPUT, NOW, ZONE));
+    await drained();
+    t.mock.timers.tick(PRE_WRITE_WAIT_MS - 1);
+    await drained();
+    assert.deepEqual([refreshes, creates.length, answer()], [[0], 0, undefined], "still giving the fresh read its time");
+    t.mock.timers.tick(1);
+    await drained();
+    assert.equal(answer()?.status, "saved_locally_verified");
+    assert.equal(creates.length, 1);
+  } finally {
+    release();
+  }
+});
+
+test("after a save that reported an error, the re-read waits for a stuck refresh no longer than the first read did", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { sync, creates, refreshes, release } = fakeSync({
+    views: [view([]), view([meeting({ id: "late-1" })])],
+    createError: "the calendar helper timed out",
+    stuckRefresh: true,
+  });
+  try {
+    const answer = pending(answerAddEvent(sync, INPUT, NOW, ZONE));
+    await drained();
+    t.mock.timers.tick(PRE_WRITE_WAIT_MS);
+    await drained();
+    assert.deepEqual([refreshes, creates.length, answer()], [[0, 1], 1, undefined], "saved with an error, now waiting on the second refresh");
+    t.mock.timers.tick(PRE_WRITE_WAIT_MS - 1);
+    await drained();
+    assert.equal(answer(), undefined);
+    t.mock.timers.tick(1);
+    await drained();
+    assert.deepEqual([answer()?.status, answer()?.event?.event_id, creates.length], ["saved_unverified", "late-1", 1]);
+  } finally {
+    release();
+  }
+});
+
+test("two adds at once while the refresh is stuck still write once: the queue, not the refresh, orders them", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const saved: EventView[] = [];
+  const creates: unknown[] = [];
+  const stuck = stuckRefreshes();
+  const sync: AssistantSync = {
+    settings: async () => settings(),
+    range: async () => view([...saved]),
+    create: async (input) => {
+      creates.push(input);
+      saved.push(meeting({ id: `new-${creates.length}` }));
+      return { event: null, error: "" };
+    },
+    refresh: stuck.refresh,
+  };
+  try {
+    const first = pending(answerAddEvent(sync, INPUT, NOW, ZONE));
+    const second = pending(answerAddEvent(sync, INPUT, NOW, ZONE));
+    await drained();
+    t.mock.timers.tick(PRE_WRITE_WAIT_MS);
+    await drained();
+    assert.deepEqual([first()?.status, second(), creates.length], ["saved_locally_verified", undefined, 1], "the second waits its turn");
+    t.mock.timers.tick(PRE_WRITE_WAIT_MS);
+    await drained();
+    assert.deepEqual([second()?.status, creates.length], ["already_exists", 1]);
+  } finally {
+    stuck.release();
+  }
 });
 
 test("saved but not found on the way back is still done, so ChatGPT never adds it twice", async () => {

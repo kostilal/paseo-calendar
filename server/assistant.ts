@@ -18,7 +18,7 @@ import type {
   SettingsView,
 } from "../shared/calendar.ts";
 import { addDays, failureNote, localDate, localTime, oneLine, sameMailbox, zonedMidnight } from "../shared/schedule.ts";
-import type { Sync } from "./sync.ts";
+import { waitAtMost, type Sync } from "./sync.ts";
 
 /**
  * What ChatGPT reads, through God Mode, to find a calendar and add one event to it: `calendars`,
@@ -41,6 +41,18 @@ export const ACCESS_HELP =
 export const SYNC_NOTE =
   "Saved in Apple Calendar on this Mac and read back. macOS uploads it to the account in the background; EventKit does not report " +
   "whether the provider has accepted it, so provider sync is not confirmed here (check the provider's own calendar, or ask again in a minute).";
+
+/**
+ * How long a real add waits for the refresh it starts before reading the day, and again after a
+ * save that reported an error. One account whose helper is stuck holds a refresh for 15 seconds
+ * or more, and create() waits up to POST_WRITE_WAIT_MS for its own: together they can pass the
+ * plugin host's 30 seconds, and God Mode then tells ChatGPT it does not know whether the add took
+ * effect. Past the cap the add reads whatever range() gives it; the add queue below still keeps a
+ * second add from reading before the first one's create. This bounds the add's own wait only:
+ * sync's range() waits for a refresh in flight and its create() queues behind one, so against the
+ * real sync a stuck refresh still holds the read and the write for as long as it runs.
+ */
+export const PRE_WRITE_WAIT_MS = 5_000;
 
 /** What the assistant needs from sync, so a test can hand in its own. */
 export type AssistantSync = Pick<Sync, "settings" | "range" | "create" | "refresh">;
@@ -248,8 +260,9 @@ async function addOrPreview(sync: AssistantSync, input: AddEventInput, nowMs: nu
   const to = new Date(Math.max(zonedMidnight(addDays(plan.date, 1), zone), plan.endMs));
   // Before a write, the day is read fresh rather than from the snapshot, which can be minutes old:
   // an event added on the phone since then must still be found as the copy it is. A preview reads
-  // what is held, since it writes nothing. A refresh that fails leaves range() to decide.
-  if (!input.dry_run) await sync.refresh().catch(() => undefined);
+  // what is held, since it writes nothing. A refresh that fails, or is still running after
+  // PRE_WRITE_WAIT_MS, leaves range() to decide.
+  if (!input.dry_run) await waitAtMost(sync.refresh(), PRE_WRITE_WAIT_MS);
   let day: EventsView;
   try {
     day = await sync.range(from, to);
@@ -316,9 +329,10 @@ async function addOrPreview(sync: AssistantSync, input: AddEventInput, nowMs: nu
     .catch((error: unknown) => ({ event: null, error: messageOf(error) }));
   if (result.error) {
     // A helper that timed out may have saved anyway, and create() skips its refresh after an
-    // error, so the snapshot cannot say. A fresh pass and a second read decide: "nothing added"
-    // while the event is there is exactly the answer that makes ChatGPT add it again.
-    await sync.refresh().catch(() => undefined);
+    // error, so the snapshot cannot say. A fresh pass, waited for no longer than the one before
+    // the write, and a second read decide: "nothing added" while the event is there is exactly
+    // the answer that makes ChatGPT add it again.
+    await waitAtMost(sync.refresh(), PRE_WRITE_WAIT_MS);
     const again = await sync.range(from, to).catch(() => null);
     const landed = again?.events.find((event) => isSameAdded(event, target, plan));
     if (!landed) return refused(result.error);
